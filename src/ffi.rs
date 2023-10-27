@@ -7,14 +7,20 @@ use uuid::Uuid;
 use core::slice;
 use std::{mem::forget, os::raw::c_char, time::Duration};
 
-use crate::{peer_msg::PeerMessage, safe_bytes::SafeBytes, SOCKET};
+use crate::{
+    get_socket_instance, peer_msg::PeerMessage, reset_socket_instance, safe_bytes::SafeBytes,
+    SHOULD_STOP,
+};
 
 #[no_mangle]
 pub unsafe extern "C" fn initialize(room_url: *mut c_char) {
-    let mut guard: std::sync::MutexGuard<Option<WebRtcSocket>> = SOCKET.lock().unwrap();
+    let mut guard: std::sync::MutexGuard<Option<WebRtcSocket>> =
+        get_socket_instance().lock().unwrap();
     let remote_addr = to_string(room_url).unwrap();
 
     let (socket, future_msg) = WebRtcSocket::new_reliable(&remote_addr);
+
+    *SHOULD_STOP.lock().unwrap() = false;
 
     std::thread::spawn(move || {
         let rt = Runtime::new().unwrap();
@@ -26,16 +32,15 @@ pub unsafe extern "C" fn initialize(room_url: *mut c_char) {
             let timeout = Delay::new(Duration::from_millis(10));
             futures::pin_mut!(timeout);
 
-            // let mut should_stop = false;
-
-            // {
-            //     should_stop = *SHOULD_STOP.lock().unwrap();
-            // }
-
             loop {
-                // {
-                //     should_stop = *SHOULD_STOP.lock().unwrap();
-                // }
+                match SHOULD_STOP.try_lock() {
+                    Ok(should_stop) => {
+                        if *should_stop {
+                            break;
+                        }
+                    }
+                    Err(_) => {}
+                }
 
                 select! {
                     // Restart this loop every 100ms
@@ -49,10 +54,6 @@ pub unsafe extern "C" fn initialize(room_url: *mut c_char) {
                     }
                 }
             }
-
-            // {
-            //     *SHOULD_STOP.lock().unwrap() = false;
-            // }
         });
     });
 
@@ -61,45 +62,20 @@ pub unsafe extern "C" fn initialize(room_url: *mut c_char) {
 
 #[no_mangle]
 pub unsafe extern "C" fn disconnect() {
-    let mut guard = SOCKET.lock().unwrap();
-
-    if guard.is_some() {
-        guard.take().unwrap();
-
-        // let mut can_go = false;
-
-        // while !can_go {
-        //     match SHOULD_STOP.try_lock() {
-        //         Ok(mut should_stop) => {
-        //             *should_stop = true;
-        //             can_go = true;
-        //         }
-        //         Err(_) => {}
-        //     }
-        // }
-
-        *guard = None;
-    }
+    reset_socket_instance();
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn poll_message() -> SafeBytes {
-    let mut guard = SOCKET.lock().unwrap();
+    let mut guard = get_socket_instance().lock().unwrap();
 
     if guard.is_some() {
         let mut socket = guard.take().unwrap();
-
-        // let mut logger: TcpStream =
-        //     TcpStream::connect("127.0.0.1:8080").expect("Failed to connect to logger");
 
         // Handle any new peers
         for (peer, state) in socket.update_peers() {
             match state {
                 PeerState::Connected => {
-                    // logger
-                    //     .write(format!("RUST : New peer {:#?} ", peer).as_bytes())
-                    //     .unwrap();
-
                     let packet = "Greetings".as_bytes().to_vec().into_boxed_slice();
                     socket.send(packet, peer);
                 }
@@ -141,7 +117,7 @@ pub unsafe extern "C" fn poll_message() -> SafeBytes {
 
 #[no_mangle]
 pub unsafe extern "C" fn send_message(message: *mut c_char, peer_id: *mut c_char) {
-    let mut guard = SOCKET.lock().unwrap();
+    let mut guard = get_socket_instance().lock().unwrap();
 
     if guard.is_some() {
         let mut socket = guard.take().unwrap();
